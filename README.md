@@ -91,9 +91,9 @@ AZURE_CLIENT_SECRET   = "your-client-secret"
 
 # ── GCP ───────────────────────────────────────────────────────────
 GCP_DATASET_TABLE      = "project.dataset.gcp_billing_export_resource_v1_XXXXXX"
-GCP_SERVICE_ACCOUNT_JSON = "insights-318308-bce1cf181445.json"
-GCP_BILLING_ACCOUNT_ID = "XXXXXX-XXXXXX-XXXXXX"   # e.g. 012858-08E31F-AB0A26
-GCP_PROJECT_ID         = "insights-318308"
+GCP_SERVICE_ACCOUNT_JSON = "Your_service_account.json"
+GCP_BILLING_ACCOUNT_ID = "XXXXXX-XXXXXX-XXXXXX"  
+GCP_PROJECT_ID         = "Your Project ID"
 
 # ── Report settings ───────────────────────────────────────────────
 REPORT_DAY  = 28        # Day of month to cap the report end date
