@@ -9,7 +9,7 @@ def utcnow():
 
 from config import (
     # Azure AD / Graph API
-    TENANT_ID, CLIENT_ID, CLIENT_SECRET, FROM_EMAIL, TO_EMAIL,
+    TENANT_ID, CLIENT_ID, CLIENT_SECRET, FROM_EMAIL, TO_EMAIL, CC_EMAIL,
 
     # AWS
     AWS_ACCESS_KEY, AWS_SECRET_KEY, AWS_REGION,
@@ -380,29 +380,8 @@ def fetch_gcp_cost(start, end):
 
 # ─────────────────────────────────────────────
 # GCP — Forecast (direct from GCP Budgets API, returns billing currency)
-# Same approach as AWS Cost Explorer / Azure Forecast API
 # ─────────────────────────────────────────────
 def fetch_gcp_forecast(start: str, end: str) -> float | None:
-    """
-    Fetches the projected month-end spend directly from the GCP Cloud Billing
-    Budget API — equivalent to what AWS CE and Azure Forecast API return.
-
-    Strategy:
-      1. List all budgets under the billing account via Cloud Billing Budget API.
-      2. Sum up 'forecastedSpend.units' across budgets for the current month.
-         If no budgets exist, fall back to a linear projection using BigQuery
-         actual spend data (same formula as compute_forecast).
-
-    Prerequisites in config.py:
-      GCP_BILLING_ACCOUNT_ID = "012858-08E31F-AB0A26"  (your billing account ID)
-      GCP_PROJECT_ID         = "insights-318308"        (project hosting the SA)
-
-    The Service Account (GCP_SERVICE_ACCOUNT_JSON) needs:
-      roles/billing.viewer  on the billing account
-
-    Returns amount in billing currency (INR). Caller applies INR→USD conversion.
-    Returns None to signal caller should use linear estimate.
-    """
     try:
         import calendar
         from google.cloud import billing_budgets_v1
@@ -426,7 +405,6 @@ def fetch_gcp_forecast(start: str, end: str) -> float | None:
             print("     GCP forecast: no budgets found on billing account; using linear estimate")
             return None
 
-        # Sum forecasted spend across all budgets for current month
         start_dt      = datetime.strptime(start, "%Y-%m-%d").date()
         days_in_month = calendar.monthrange(start_dt.year, start_dt.month)[1]
 
@@ -435,9 +413,7 @@ def fetch_gcp_forecast(start: str, end: str) -> float | None:
 
         for budget in budgets:
             try:
-                # forecastedSpend reflects ML-projected month-end spend
                 if budget.amount and budget.amount.last_period_amount:
-                    # last_period_amount type — skip, not a forecast
                     continue
                 if hasattr(budget, "forecasted_spend") and budget.forecasted_spend:
                     units  = float(budget.forecasted_spend.units or 0)
@@ -467,6 +443,8 @@ def fetch_gcp_forecast(start: str, end: str) -> float | None:
 # ─────────────────────────────────────────────
 # HTML Builder
 # ─────────────────────────────────────────────
+AWS_ACCOUNT_ID = "230753728425"
+
 def build_table_rows(data):
     if "ERROR" in data:
         return f'<tr><td colspan="2" style="color:#c0392b;padding:8px 12px">⚠ Error: {data["ERROR"]}</td></tr>'
@@ -527,7 +505,7 @@ def section(cloud_name, color, data, date_label, fc: dict) -> str:
     total_str = cloud_total_str(data)
     return f"""
     <h3 style="margin:28px 0 4px;color:{color};font-size:16px">{cloud_name} — {total_str}</h3>
-    <p style="margin:0 0 8px;font-size:12px;color:#999">{date_label}</p>
+    <p style="margin:0 0 8px;font-size:14px;font-weight:700;color:#222">{date_label}</p>
     <table style="width:100%;border-collapse:collapse;background:#ffffff;
                   border-radius:8px;overflow:hidden;
                   box-shadow:0 1px 3px rgba(0,0,0,0.08)">
@@ -554,10 +532,8 @@ def build_html(aws, azure, gcp, start, end,
     fc_azure = fc_azure or compute_forecast(total_azure, start, end)
     fc_gcp   = fc_gcp   or compute_forecast(total_gcp,   start, end)
 
-    # AWS & Azure use the normal calculated date label
     aws_azure_date_label = f"{start} → {end} (day 1–{fc_aws['days_elapsed']} of month)"
 
-    # GCP uses the actual BQ data end date to be honest about export lag
     gcp_end_display = gcp_actual_end or end
     gcp_date_label  = (
         f"{start} → {gcp_end_display} "
@@ -602,15 +578,17 @@ def build_html(aws, azure, gcp, start, end,
         <tr>
           <td style="padding:24px 28px">
 
-            <!-- Summary cards — plain solid colors, no gradients/fades -->
+            <!-- Summary cards -->
             <table width="100%" cellpadding="0" cellspacing="0" border="0"
                    style="margin-bottom:20px">
               <tr>
                 <!-- AWS card -->
                 <td width="32%" style="background:{AWS_COLOR};border-radius:8px;
                                        padding:14px 10px;text-align:center">
-                  <div style="font-size:11px;color:#ffe0c0;margin-bottom:4px;
+                  <div style="font-size:11px;color:#ffe0c0;margin-bottom:2px;
                                text-transform:uppercase;letter-spacing:.5px">AWS (USD)</div>
+                  <div style="font-size:10px;color:#ffe0c0;margin-bottom:4px;
+                               letter-spacing:.3px">{AWS_ACCOUNT_ID}</div>
                   <div style="font-size:20px;font-weight:700;color:#ffffff">${total_aws:,.2f}</div>
                   <div style="font-size:11px;color:#ffe0c0;margin-top:2px">Forecast ${fc_aws['forecast']:,.2f}</div>
                 </td>
@@ -635,9 +613,9 @@ def build_html(aws, azure, gcp, start, end,
               </tr>
             </table>
 
-            {section("AWS",   AWS_COLOR,   aws,   aws_azure_date_label, fc_aws)}
-            {section("Azure", AZURE_COLOR, azure, aws_azure_date_label, fc_azure)}
-            {section("GCP",   GCP_COLOR,   gcp,   gcp_date_label,       fc_gcp)}
+            {section(f"AWS ({AWS_ACCOUNT_ID})", AWS_COLOR,   aws,   aws_azure_date_label, fc_aws)}
+            {section("Azure",                   AZURE_COLOR, azure, aws_azure_date_label, fc_azure)}
+            {section("GCP",                     GCP_COLOR,   gcp,   gcp_date_label,       fc_gcp)}
 
             {note_block(EMAIL_NOTE)}
 
@@ -683,7 +661,7 @@ def send_email(token: str, html: str, start: str, end: str):
     }
     payload = {
         "message": {
-            "subject": f"☁️ Cloud Cost Report | {start} to {end}",
+            "subject": f"☁️ Cloud Cost Report | {start} to {end} | AWS: {AWS_ACCOUNT_ID}",
             "body": {
                 "contentType": "HTML",
                 "content": html,
@@ -691,12 +669,15 @@ def send_email(token: str, html: str, start: str, end: str):
             "toRecipients": [
                 {"emailAddress": {"address": email}} for email in TO_EMAIL
             ],
+            "ccRecipients": [
+                {"emailAddress": {"address": email}} for email in CC_EMAIL
+            ],
         },
         "saveToSentItems": "true",
     }
     response = requests.post(url, headers=headers, json=payload)
     response.raise_for_status()
-    print(f"✅ Email sent to {TO_EMAIL}")
+    print(f"✅ Email sent to {TO_EMAIL}, cc: {CC_EMAIL}")
 
 
 # ─────────────────────────────────────────────
@@ -755,7 +736,6 @@ if __name__ == "__main__":
     print("\n  → GCP (MTD actual) ...")
     gcp_start, gcp_end = get_gcp_date_range()
 
-    # fetch_gcp_cost returns (data, actual_end_date)
     gcp_raw, gcp_actual_end = fetch_gcp_cost(gcp_start, gcp_end)
     gcp = convert_inr_dict_to_usd(gcp_raw, inr_to_usd)
 
