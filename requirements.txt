@@ -1,0 +1,8 @@
+boto3
+requests 
+azure-identity 
+azure-mgmt-costmanagement 
+google-auth 
+google-auth-httplib2
+google-cloud-bigquery
+google-cloud-billing-budgets
