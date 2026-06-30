@@ -1,6 +1,7 @@
 import time
 import requests
 import boto3
+import calendar
 from datetime import datetime, timedelta, timezone
 
 def utcnow():
@@ -20,8 +21,8 @@ from config import (
     # GCP
     GCP_DATASET_TABLE,
     GCP_SERVICE_ACCOUNT_JSON,
-    GCP_BILLING_ACCOUNT_ID,   # NEW: e.g. "012858-08E31F-AB0A26"
-    GCP_PROJECT_ID,           # NEW: e.g. "insights-318308"
+    GCP_BILLING_ACCOUNT_ID,
+    GCP_PROJECT_ID,
 
     # Shared config
     REPORT_DAY,
@@ -33,15 +34,8 @@ from config import (
 # Currency: INR → USD
 # ─────────────────────────────────────────────
 def get_inr_to_usd_rate() -> float:
-    """
-    Fetches live INR→USD exchange rate from Open Exchange Rates (free, no key needed).
-    Falls back to a hardcoded rate (0.012) if the request fails.
-    """
     try:
-        resp = requests.get(
-            "https://open.er-api.com/v6/latest/USD",
-            timeout=5,
-        )
+        resp = requests.get("https://open.er-api.com/v6/latest/USD", timeout=5)
         resp.raise_for_status()
         data = resp.json()
         inr_per_usd = data["rates"]["INR"]
@@ -55,7 +49,6 @@ def get_inr_to_usd_rate() -> float:
 
 
 def convert_inr_dict_to_usd(data: dict, rate: float) -> dict:
-    """Multiply every value in a service→amount dict by the INR→USD rate."""
     if "ERROR" in data:
         return data
     return {svc: round(amt * rate, 2) for svc, amt in data.items()}
@@ -65,10 +58,25 @@ def convert_inr_dict_to_usd(data: dict, rate: float) -> dict:
 # Date Ranges
 # ─────────────────────────────────────────────
 def get_date_range():
+    """
+    Returns (start, end, is_month_end).
+
+    is_month_end is True when REPORT_DAY (clamped to the number of days
+    in the current month) equals the last day of the month — meaning
+    this run represents a closing/final report for the month, not a
+    mid-month snapshot, so forecasts should be omitted.
+
+    REPORT_DAY is clamped instead of passed straight into .replace(day=...)
+    because e.g. REPORT_DAY=31 would crash with a ValueError in any
+    30-day or 28/29-day month.
+    """
     today = utcnow().date()
     start = today.replace(day=1)
-    end   = min(today, today.replace(day=int(REPORT_DAY))) + timedelta(days=1)
-    return str(start), str(end)
+    days_in_month = calendar.monthrange(today.year, today.month)[1]
+    report_day_clamped = min(int(REPORT_DAY), days_in_month)
+    end = min(today, today.replace(day=report_day_clamped)) + timedelta(days=1)
+    is_month_end = report_day_clamped >= days_in_month
+    return str(start), str(end), is_month_end
 
 
 def get_gcp_date_range():
@@ -79,12 +87,14 @@ def get_gcp_date_range():
 # Forecast helpers
 # ─────────────────────────────────────────────
 def compute_forecast(actual_total: float, start_str: str, end_str: str,
-                     forecast_override: float = None) -> dict:
+                     forecast_override: float = None, skip: bool = False) -> dict | None:
     """
-    forecast_override: if provided (e.g. from a cloud forecast API),
-    use it directly instead of the linear estimate.
+    skip=True returns None — used for month-end reports where a forecast
+    is meaningless (the month is already over).
     """
-    import calendar
+    if skip:
+        return None
+
     start = datetime.strptime(start_str, "%Y-%m-%d").date()
     end   = datetime.strptime(end_str,   "%Y-%m-%d").date()
 
@@ -109,10 +119,6 @@ def compute_forecast(actual_total: float, start_str: str, end_str: str,
 # AWS — Cost (MTD actual)
 # ─────────────────────────────────────────────
 def fetch_aws_cost(start, end):
-    """
-    Uses DAILY granularity and sums across days so the total matches
-    the AWS console month-to-date figure more closely than MONTHLY.
-    """
     try:
         client = boto3.client(
             "ce",
@@ -142,18 +148,11 @@ def fetch_aws_cost(start, end):
 # AWS — Forecast (direct from Cost Explorer)
 # ─────────────────────────────────────────────
 def fetch_aws_forecast(start: str, end: str) -> float | None:
-    """
-    Fetches the full-month forecast directly from AWS Cost Explorer.
-    get_cost_forecast returns forecast for REMAINING days only —
-    matches what the AWS console displays as 'Forecasted amount'.
-    Do NOT add MTD on top of this value.
-    """
     try:
-        import calendar
         start_dt      = datetime.strptime(start, "%Y-%m-%d").date()
         days_in_month = calendar.monthrange(start_dt.year, start_dt.month)[1]
         month_end     = start_dt.replace(day=days_in_month)
-        forecast_end  = str(month_end + timedelta(days=1))   # CE needs exclusive end
+        forecast_end  = str(month_end + timedelta(days=1))
         today_str     = str(utcnow().date())
 
         client = boto3.client(
@@ -178,10 +177,6 @@ def fetch_aws_forecast(start: str, end: str) -> float | None:
 # Azure — Cost (MTD actual, returns INR)
 # ─────────────────────────────────────────────
 def fetch_azure_cost(start, end, retries=4, initial_delay=10):
-    """
-    Azure Cost Management returns values in the subscription's billing currency
-    (INR for most Indian subscriptions). Caller applies INR→USD conversion.
-    """
     from azure.identity import ClientSecretCredential
     from azure.mgmt.costmanagement import CostManagementClient
     from azure.mgmt.costmanagement.models import (
@@ -237,14 +232,7 @@ def fetch_azure_cost(start, end, retries=4, initial_delay=10):
 # Azure — Forecast (direct from Cost Management API, returns INR)
 # ─────────────────────────────────────────────
 def fetch_azure_forecast(start: str, end: str, retries=4, initial_delay=10) -> float | None:
-    """
-    Fetches the full-month projected cost directly from the Azure Cost Management
-    forecast API — same figure shown in the Azure portal Cost Analysis view.
-    Returns amount in billing currency (INR). Caller applies INR→USD conversion.
-    include_actual_cost=True combines actual (past) + ML forecast (remaining days).
-    """
     try:
-        import calendar
         from azure.identity import ClientSecretCredential
         from azure.mgmt.costmanagement import CostManagementClient
         from azure.mgmt.costmanagement.models import (
@@ -300,14 +288,8 @@ def fetch_azure_forecast(start: str, end: str, retries=4, initial_delay=10) -> f
 
 # ─────────────────────────────────────────────
 # GCP — Cost (MTD actual, via BigQuery billing export)
-# Returns (data_dict, gcp_actual_end_date_str)
 # ─────────────────────────────────────────────
 def fetch_gcp_cost(start, end):
-    """
-    Returns (costs_dict, actual_end_date) where actual_end_date is the
-    real latest date present in BigQuery (accounts for export lag).
-    Costs are in billing currency (INR). Caller converts to USD.
-    """
     try:
         from google.cloud import bigquery
         from google.oauth2 import service_account
@@ -321,11 +303,9 @@ def fetch_gcp_cost(start, end):
         )
         client = bigquery.Client(credentials=creds, project=creds.project_id)
 
-        # Widen window by 3 days to account for BQ export lag
         end_dt     = datetime.strptime(end, "%Y-%m-%d").date()
         end_padded = str(end_dt + timedelta(days=3))
 
-        # ── Step 1: find the actual latest date with data in BQ ──────────
         max_date_query = f"""
             SELECT MAX(DATE(usage_start_time)) AS max_date
             FROM `{GCP_DATASET_TABLE}`
@@ -339,7 +319,6 @@ def fetch_gcp_cost(start, end):
             gcp_actual_end = end
         print(f"     GCP BQ export — actual data available up to: {gcp_actual_end}")
 
-        # ── Step 2: fetch cost data using padded end (catches lag) ────────
         query = f"""
             SELECT
                 service.description          AS service_name,
@@ -383,7 +362,6 @@ def fetch_gcp_cost(start, end):
 # ─────────────────────────────────────────────
 def fetch_gcp_forecast(start: str, end: str) -> float | None:
     try:
-        import calendar
         from google.cloud import billing_budgets_v1
         from google.oauth2 import service_account as sa_module
 
@@ -404,9 +382,6 @@ def fetch_gcp_forecast(start: str, end: str) -> float | None:
         if not budgets:
             print("     GCP forecast: no budgets found on billing account; using linear estimate")
             return None
-
-        start_dt      = datetime.strptime(start, "%Y-%m-%d").date()
-        days_in_month = calendar.monthrange(start_dt.year, start_dt.month)[1]
 
         total_forecast = 0.0
         budget_count   = 0
@@ -490,6 +465,17 @@ def forecast_row(fc: dict, color: str) -> str:
     </div>"""
 
 
+def month_final_badge(color: str) -> str:
+    """Shown instead of the forecast bar when the report is a month-end/final report."""
+    return f"""
+    <div style="margin-top:10px;padding:10px 14px;background:#f9f9f9;
+                border-radius:6px;border-left:3px solid {color}">
+      <span style="font-size:12px;font-weight:600;color:{color}">
+        ✅ Final total for the month — no forecast (month complete)
+      </span>
+    </div>"""
+
+
 def note_block(note: str) -> str:
     if not note or not note.strip():
         return ""
@@ -501,8 +487,18 @@ def note_block(note: str) -> str:
     </div>"""
 
 
-def section(cloud_name, color, data, date_label, fc: dict) -> str:
+def section(cloud_name, color, data, date_label, fc: dict | None, is_month_end: bool) -> str:
     total_str = cloud_total_str(data)
+
+    if "ERROR" in data:
+        footer_html = ""
+    elif fc is not None:
+        footer_html = forecast_row(fc, color)
+    elif is_month_end:
+        footer_html = month_final_badge(color)
+    else:
+        footer_html = ""
+
     return f"""
     <h3 style="margin:28px 0 4px;color:{color};font-size:16px">{cloud_name} — {total_str}</h3>
     <p style="margin:0 0 8px;font-size:14px;font-weight:700;color:#222">{date_label}</p>
@@ -517,10 +513,18 @@ def section(cloud_name, color, data, date_label, fc: dict) -> str:
       </thead>
       <tbody>{build_table_rows(data)}</tbody>
     </table>
-    {"" if "ERROR" in data else forecast_row(fc, color)}"""
+    {footer_html}"""
 
 
-def build_html(aws, azure, gcp, start, end,
+def report_title(start: str, is_month_end: bool) -> str:
+    """'June 2026 Report (Final)' for month-end runs, plain date range otherwise."""
+    start_dt = datetime.strptime(start, "%Y-%m-%d").date()
+    if is_month_end:
+        return f"{start_dt.strftime('%B %Y')} Report (Final)"
+    return None  # signals caller to use the date-range label instead
+
+
+def build_html(aws, azure, gcp, start, end, is_month_end: bool,
                fc_aws=None, fc_azure=None, fc_gcp=None,
                gcp_actual_end=None):
 
@@ -528,16 +532,29 @@ def build_html(aws, azure, gcp, start, end,
     total_azure = sum(azure.values()) if "ERROR" not in azure else 0.0
     total_gcp   = sum(gcp.values())   if "ERROR" not in gcp   else 0.0
 
-    fc_aws   = fc_aws   or compute_forecast(total_aws,   start, end)
-    fc_azure = fc_azure or compute_forecast(total_azure, start, end)
-    fc_gcp   = fc_gcp   or compute_forecast(total_gcp,   start, end)
+    # Only fill in a default forecast if the caller didn't already decide
+    # to skip it (month-end) and didn't pass one in.
+    if fc_aws is None and not is_month_end:
+        fc_aws = compute_forecast(total_aws, start, end)
+    if fc_azure is None and not is_month_end:
+        fc_azure = compute_forecast(total_azure, start, end)
+    if fc_gcp is None and not is_month_end:
+        fc_gcp = compute_forecast(total_gcp, start, end)
 
-    aws_azure_date_label = f"{start} → {end} (day 1–{fc_aws['days_elapsed']} of month)"
+    days_elapsed_label = fc_aws['days_elapsed'] if fc_aws else (
+        datetime.strptime(end, "%Y-%m-%d").date() - datetime.strptime(start, "%Y-%m-%d").date()
+    ).days
+
+    month_title = report_title(start, is_month_end)
+    aws_azure_date_label = (
+        month_title if month_title
+        else f"{start} → {end} (day 1–{days_elapsed_label} of month)"
+    )
 
     gcp_end_display = gcp_actual_end or end
-    gcp_date_label  = (
-        f"{start} → {gcp_end_display} "
-        f"(BQ export lag — data available up to {gcp_end_display})"
+    gcp_date_label = (
+        month_title if month_title
+        else f"{start} → {gcp_end_display} (BQ export lag — data available up to {gcp_end_display})"
     )
 
     generated = utcnow().strftime("%Y-%m-%d %H:%M")
@@ -545,6 +562,11 @@ def build_html(aws, azure, gcp, start, end,
     AWS_COLOR   = "#E8811A"
     AZURE_COLOR = "#0072C6"
     GCP_COLOR   = "#1E8E3E"
+
+    header_subtitle = month_title if month_title else f"{start} → {end}"
+
+    def forecast_line(fc):
+        return f"Forecast ${fc['forecast']:,.2f}" if fc else ("Month closed" if is_month_end else "")
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -569,7 +591,7 @@ def build_html(aws, azure, gcp, start, end,
               ☁️ Cloud Cost Report
             </div>
             <div style="font-size:12px;color:#a0aabf;margin-top:4px">
-              Generated on {generated} UTC &nbsp;·&nbsp; {aws_azure_date_label}
+              Generated on {generated} UTC &nbsp;·&nbsp; {header_subtitle}
             </div>
           </td>
         </tr>
@@ -590,7 +612,7 @@ def build_html(aws, azure, gcp, start, end,
                   <div style="font-size:10px;color:#ffe0c0;margin-bottom:4px;
                                letter-spacing:.3px">{AWS_ACCOUNT_ID}</div>
                   <div style="font-size:20px;font-weight:700;color:#ffffff">${total_aws:,.2f}</div>
-                  <div style="font-size:11px;color:#ffe0c0;margin-top:2px">Forecast ${fc_aws['forecast']:,.2f}</div>
+                  <div style="font-size:11px;color:#ffe0c0;margin-top:2px">{forecast_line(fc_aws)}</div>
                 </td>
                 <td width="2%"></td>
                 <!-- Azure card -->
@@ -599,7 +621,7 @@ def build_html(aws, azure, gcp, start, end,
                   <div style="font-size:11px;color:#d0e8ff;margin-bottom:4px;
                                text-transform:uppercase;letter-spacing:.5px">Azure (USD)</div>
                   <div style="font-size:20px;font-weight:700;color:#ffffff">${total_azure:,.2f}</div>
-                  <div style="font-size:11px;color:#d0e8ff;margin-top:2px">Forecast ${fc_azure['forecast']:,.2f}</div>
+                  <div style="font-size:11px;color:#d0e8ff;margin-top:2px">{forecast_line(fc_azure)}</div>
                 </td>
                 <td width="2%"></td>
                 <!-- GCP card -->
@@ -608,14 +630,14 @@ def build_html(aws, azure, gcp, start, end,
                   <div style="font-size:11px;color:#c0f0d0;margin-bottom:4px;
                                text-transform:uppercase;letter-spacing:.5px">GCP (USD)</div>
                   <div style="font-size:20px;font-weight:700;color:#ffffff">${total_gcp:,.2f}</div>
-                  <div style="font-size:11px;color:#c0f0d0;margin-top:2px">Forecast ${fc_gcp['forecast']:,.2f}</div>
+                  <div style="font-size:11px;color:#c0f0d0;margin-top:2px">{forecast_line(fc_gcp)}</div>
                 </td>
               </tr>
             </table>
 
-            {section(f"AWS ({AWS_ACCOUNT_ID})", AWS_COLOR,   aws,   aws_azure_date_label, fc_aws)}
-            {section("Azure",                   AZURE_COLOR, azure, aws_azure_date_label, fc_azure)}
-            {section("GCP",                     GCP_COLOR,   gcp,   gcp_date_label,       fc_gcp)}
+            {section(f"AWS ({AWS_ACCOUNT_ID})", AWS_COLOR,   aws,   aws_azure_date_label, fc_aws,   is_month_end)}
+            {section("Azure",                   AZURE_COLOR, azure, aws_azure_date_label, fc_azure, is_month_end)}
+            {section("GCP",                     GCP_COLOR,   gcp,   gcp_date_label,       fc_gcp,   is_month_end)}
 
             {note_block(EMAIL_NOTE)}
 
@@ -653,15 +675,22 @@ def get_access_token() -> str:
     return response.json()["access_token"]
 
 
-def send_email(token: str, html: str, start: str, end: str):
+def send_email(token: str, html: str, start: str, end: str, is_month_end: bool):
     url = f"https://graph.microsoft.com/v1.0/users/{FROM_EMAIL}/sendMail"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type":  "application/json",
     }
+
+    month_title = report_title(start, is_month_end)
+    if month_title:
+        subject = f"☁️ Cloud Cost Report | {month_title} "
+    else:
+        subject = f"☁️ Cloud Cost Report | {start} to {end}"
+
     payload = {
         "message": {
-            "subject": f"☁️ Cloud Cost Report | {start} to {end} | AWS: {AWS_ACCOUNT_ID}",
+            "subject": subject,
             "body": {
                 "contentType": "HTML",
                 "content": html,
@@ -684,10 +713,9 @@ def send_email(token: str, html: str, start: str, end: str):
 # Main
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
-    start, end = get_date_range()
-    print(f"📅 Reporting period : {start} → {end}  (REPORT_DAY={REPORT_DAY})")
+    start, end, is_month_end = get_date_range()
+    print(f"📅 Reporting period : {start} → {end}  (REPORT_DAY={REPORT_DAY}, month_end={is_month_end})")
 
-    # Fetch live exchange rate once — used for Azure + GCP
     inr_to_usd = get_inr_to_usd_rate()
 
     # ── AWS ──────────────────────────────────────────────────────────────
@@ -695,17 +723,21 @@ if __name__ == "__main__":
     aws = fetch_aws_cost(start, end)
     if "ERROR" not in aws:
         total_aws = sum(aws.values())
-        print(f"     AWS MTD total : ${total_aws:,.2f}")
+        print(f"     AWS total : ${total_aws:,.2f}")
 
-        print("  → AWS forecast ...")
-        aws_forecast_raw = fetch_aws_forecast(start, end)
-        if aws_forecast_raw is not None:
-            print(f"     AWS forecast (CE API): ${aws_forecast_raw:,.2f}")
-            fc_aws = compute_forecast(total_aws, start, end,
-                                      forecast_override=aws_forecast_raw)
+        if is_month_end:
+            fc_aws = None
+            print("     AWS forecast skipped (month-end report)")
         else:
-            fc_aws = compute_forecast(total_aws, start, end)
-            print(f"     AWS forecast (linear): ${fc_aws['forecast']:,.2f}")
+            print("  → AWS forecast ...")
+            aws_forecast_raw = fetch_aws_forecast(start, end)
+            if aws_forecast_raw is not None:
+                print(f"     AWS forecast (CE API): ${aws_forecast_raw:,.2f}")
+                fc_aws = compute_forecast(total_aws, start, end,
+                                          forecast_override=aws_forecast_raw)
+            else:
+                fc_aws = compute_forecast(total_aws, start, end)
+                print(f"     AWS forecast (linear): ${fc_aws['forecast']:,.2f}")
     else:
         print(f"     AWS error : {aws['ERROR']}")
         fc_aws = None
@@ -716,25 +748,29 @@ if __name__ == "__main__":
     azure     = convert_inr_dict_to_usd(azure_raw, inr_to_usd)
     if "ERROR" not in azure:
         total_azure = sum(azure.values())
-        print(f"     Azure MTD total (USD) : ${total_azure:,.2f}")
+        print(f"     Azure total (USD) : ${total_azure:,.2f}")
 
-        print("  → Azure forecast ...")
-        azure_fc_inr = fetch_azure_forecast(start, end)
-        if azure_fc_inr is not None:
-            azure_fc_usd = round(azure_fc_inr * inr_to_usd, 2)
-            print(f"     Azure forecast (USD) : ${azure_fc_usd:,.2f}")
-            fc_azure = compute_forecast(total_azure, start, end,
-                                        forecast_override=azure_fc_usd)
+        if is_month_end:
+            fc_azure = None
+            print("     Azure forecast skipped (month-end report)")
         else:
-            fc_azure = compute_forecast(total_azure, start, end)
-            print(f"     Azure forecast (linear): ${fc_azure['forecast']:,.2f}")
+            print("  → Azure forecast ...")
+            azure_fc_inr = fetch_azure_forecast(start, end)
+            if azure_fc_inr is not None:
+                azure_fc_usd = round(azure_fc_inr * inr_to_usd, 2)
+                print(f"     Azure forecast (USD) : ${azure_fc_usd:,.2f}")
+                fc_azure = compute_forecast(total_azure, start, end,
+                                            forecast_override=azure_fc_usd)
+            else:
+                fc_azure = compute_forecast(total_azure, start, end)
+                print(f"     Azure forecast (linear): ${fc_azure['forecast']:,.2f}")
     else:
         print(f"     Azure error : {azure['ERROR']}")
         fc_azure = None
 
     # ── GCP ───────────────────────────────────────────────────────────────
     print("\n  → GCP (MTD actual) ...")
-    gcp_start, gcp_end = get_gcp_date_range()
+    gcp_start, gcp_end, _ = get_gcp_date_range()  # same is_month_end as above; ignore 2nd copy
 
     gcp_raw, gcp_actual_end = fetch_gcp_cost(gcp_start, gcp_end)
     gcp = convert_inr_dict_to_usd(gcp_raw, inr_to_usd)
@@ -742,18 +778,22 @@ if __name__ == "__main__":
     if "ERROR" not in gcp:
         if gcp:
             total_gcp = sum(gcp.values())
-            print(f"     GCP MTD total (USD) : ${total_gcp:,.2f}")
+            print(f"     GCP total (USD) : ${total_gcp:,.2f}")
 
-            print("  → GCP forecast (Budgets API) ...")
-            gcp_fc_inr = fetch_gcp_forecast(gcp_start, gcp_end)
-            if gcp_fc_inr is not None:
-                gcp_fc_usd = round(gcp_fc_inr * inr_to_usd, 2)
-                print(f"     GCP forecast (USD) : ${gcp_fc_usd:,.2f}")
-                fc_gcp = compute_forecast(total_gcp, start, end,
-                                          forecast_override=gcp_fc_usd)
+            if is_month_end:
+                fc_gcp = None
+                print("     GCP forecast skipped (month-end report)")
             else:
-                fc_gcp = compute_forecast(total_gcp, start, end)
-                print(f"     GCP forecast (linear): ${fc_gcp['forecast']:,.2f}")
+                print("  → GCP forecast (Budgets API) ...")
+                gcp_fc_inr = fetch_gcp_forecast(gcp_start, gcp_end)
+                if gcp_fc_inr is not None:
+                    gcp_fc_usd = round(gcp_fc_inr * inr_to_usd, 2)
+                    print(f"     GCP forecast (USD) : ${gcp_fc_usd:,.2f}")
+                    fc_gcp = compute_forecast(total_gcp, start, end,
+                                              forecast_override=gcp_fc_usd)
+                else:
+                    fc_gcp = compute_forecast(total_gcp, start, end)
+                    print(f"     GCP forecast (linear): ${fc_gcp['forecast']:,.2f}")
         else:
             print("     GCP : no data found (check BQ table / date range)")
             fc_gcp = None
@@ -763,7 +803,7 @@ if __name__ == "__main__":
 
     print("\n  → Building HTML ...")
     html = build_html(
-        aws, azure, gcp, start, end,
+        aws, azure, gcp, start, end, is_month_end,
         fc_aws=fc_aws,
         fc_azure=fc_azure,
         fc_gcp=fc_gcp,
@@ -772,6 +812,6 @@ if __name__ == "__main__":
 
     print("  → Sending email ...")
     token = get_access_token()
-    send_email(token, html, start, end)
+    send_email(token, html, start, end, is_month_end)
 
     print("\n🎉 Done!")
